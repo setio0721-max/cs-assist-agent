@@ -1,0 +1,65 @@
+# 데스크톱 프로그램(Windows 포터블 exe) 자동 빌드
+# - 수동 실행(Actions 탭 → Run workflow): 빌드 결과를 Artifacts로 내려받기
+# - 태그 push(v1.0 등): 빌드 후 GitHub Releases에 zip 첨부
+name: Build desktop app (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install anthropic requests certifi pyinstaller
+
+      - name: Import check
+        run: python -c "import cs_core, desktop_app; print('import ok')"
+
+      - name: Build exe (PyInstaller, onedir)
+        run: pyinstaller --noconfirm --onedir --windowed --name CSAssistant --collect-data certifi desktop_app.py
+
+      - name: Self-test built exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/CSAssistant/CSAssistant.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "dist/CSAssistant/selftest.log"
+          Remove-Item "dist/CSAssistant/selftest.log"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          Copy-Item "desktop/사용법.txt" "dist/CSAssistant/"
+          Copy-Item "desktop/.env.example" "dist/CSAssistant/"
+          $name = if ("${{ github.ref_type }}" -eq "tag") { "CSAssistant_${{ github.ref_name }}_windows.zip" } else { "CSAssistant_dev_windows.zip" }
+          Compress-Archive -Path "dist/CSAssistant" -DestinationPath $name
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CSAssistant-windows
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          body: |
+            온솜결 CS 답변 추천 데스크톱 프로그램 (Windows 포터블)
+            - 압축을 풀고 CSAssistant.exe 실행 (설치 불필요)
+            - API 키는 포함되지 않음: [설정] 화면 또는 .env 사용 (자세한 내용은 zip 안 사용법.txt)

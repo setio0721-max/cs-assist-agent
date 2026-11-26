@@ -9,7 +9,11 @@
 ## 구성
 | 경로 | 내용 |
 |---|---|
-| `streamlit_app.py` | 챗봇 앱(로그인, 하이브리드 검색, Claude tool-use 에이전트, 대화 기록, 개인정보 마스킹, 규정 검사) |
+| `cs_core.py` | **공통 핵심 로직**(마스킹, 규정 검사, bge-m3 임베딩, Qdrant REST + Neo4j Query API 하이브리드 검색, Claude tool-use 에이전트) — 웹·데스크톱 공유 |
+| `streamlit_app.py` | 웹 앱(로그인·관리자 승인, 채팅 화면) |
+| `desktop_app.py` | 데스크톱 프로그램(항상 위 작은 창, 붙여넣기 → 추천 → 답변 복사, 설정 화면) |
+| `.github/workflows/build-desktop.yml` | Windows 포터블 exe 자동 빌드(PyInstaller) → Releases zip |
+| `desktop/` | exe와 함께 배포하는 `사용법.txt`, `.env.example` |
 | `notebooks/cs_kb_ingest.ipynb` | Colab 적재 노트북(청킹 → 개체·관계 추출 → 정합 → Neo4j → bge-m3 → Qdrant) |
 | `notebooks/build_notebook.py` | 노트북 생성 스크립트 |
 | `data/products.md`, `data/policy.md`, `data/cs_history.xlsx` | 지식 원천 자료 |
@@ -27,3 +31,8 @@
 2. Streamlit Community Cloud에서 이 저장소를 배포하고 Secrets 9개 등록
    `ANTHROPIC_API_KEY`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`, `QDRANT_URL`, `QDRANT_API_KEY`, `CF_ACCOUNT_ID`, `CF_API_TOKEN`
 3. 로그인 계정은 2주차와 같은 Neo4j `:User` 노드를 사용
+
+## 데스크톱 프로그램 (Windows 포터블)
+- 내려받기: 저장소 **Releases**의 `CSAssistant_vX.X_windows.zip` → 압축 해제 → `CSAssistant.exe` 실행(설치 불필요)
+- API 키는 포함되지 않음: 처음 실행 시 [설정] 화면에 입력하거나 exe 옆에 `.env` 배치(Streamlit Secrets 형식 그대로 가능)
+- 새 버전 배포: `git tag v1.1 && git push origin v1.1` → Actions가 빌드 후 Releases에 zip 첨부

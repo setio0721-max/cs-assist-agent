@@ -38,16 +38,14 @@ import re
 import time
 
 import streamlit as st
-import anthropic
 import bcrypt
 import requests
-from qdrant_client import QdrantClient
+
+from cs_core import (BRAND_NAME, CS_COLLECTIONS, REQUIRED_SETTINGS, CSAssistant, mask_pii)
 
 COLLECTION_PREFIX = "chunks_"
 
-# ---- 수업용 가상 브랜드 설정: 이름을 바꾸려면 이 두 값만 수정 ----
-BRAND_NAME = "온솜결"
-COMPANY_NAME = "(주)온결리빙"
+# 브랜드·회사명, 검색·에이전트 로직은 cs_core.py에서 관리(데스크톱 프로그램과 공유)
 
 st.set_page_config(page_title="CS 답변 보조 챗봇", page_icon="💬")
 
@@ -378,27 +376,18 @@ if st.sidebar.button("로그아웃"):
     st.rerun()
 
 
-# ---- 무거운 리소스는 로그인 이후에만 로드하고, 캐싱해서 한 번만 로드 ----
+# ---- 핵심 로직(cs_core.CSAssistant)은 로그인 이후에만 만들고, 캐싱해서 한 번만 생성 ----
 @st.cache_resource
-def get_anthropic_client():
-    return anthropic.Anthropic(api_key=get_secret("ANTHROPIC_API_KEY"))
+def get_core():
+    core = CSAssistant({k: get_secret(k) or "" for k in REQUIRED_SETTINGS})
+    core.connect()
+    return core
 
 
-@st.cache_resource
-def get_qdrant_client():
-    return QdrantClient(url=get_secret("QDRANT_URL"), api_key=get_secret("QDRANT_API_KEY"))
-
-
-client = get_anthropic_client()
-qdrant = get_qdrant_client()
-
-# Neo4j 연결 확인 (실패해도 앱 자체는 계속 뜨도록 처리)
-neo4j_ok = True
-try:
-    run_cypher("RETURN 1 AS ok")
-except Exception as ex:
-    neo4j_ok = False
-    st.warning(f"Neo4j 연결에 실패했습니다 (그래프 확장 기능 없이 벡터 검색만 동작합니다): {ex}")
+core = get_core()
+neo4j_ok = core.neo4j_ok
+if not neo4j_ok:
+    st.warning("Neo4j 연결에 실패했습니다 (그래프 확장 기능 없이 벡터 검색만 동작합니다).")
 
 
 # ---- 관리자 패널: 회원가입 승인/거절 ----
@@ -426,25 +415,8 @@ if st.session_state.get("is_admin") and neo4j_ok:
                 st.rerun()
 
 
-# ---- CS 지식 컬렉션: Colab 적재 노트북(notebooks/cs_kb_ingest.ipynb)이 만든 3개만 검색 ----
-# 같은 Qdrant에 있는 2주차 실습 컬렉션(chunks_doc1 등)은 검색 대상에서 제외합니다.
-CS_COLLECTIONS = {
-    "chunks_cs_products": "상품 정보",
-    "chunks_cs_policy": "고객·배송 안내",
-    "chunks_cs_history": "문의 이력",
-}
-HISTORY_TURNS = 6  # 에이전트에 넘길 최근 대화 메시지 수(질문·답변 합산)
-
-
-def list_cs_collections():
-    try:
-        existing = {c.name for c in qdrant.get_collections().collections}
-    except Exception:
-        return []
-    return [name for name in CS_COLLECTIONS if name in existing]
-
-
-available_collections = list_cs_collections()
+# ---- 사이드바: 지식 현황 (Colab 적재 노트북이 만든 CS 컬렉션 3개만 검색) ----
+available_collections = core.collections
 
 with st.sidebar:
     st.markdown("## 📚 지식 현황")
@@ -459,223 +431,6 @@ with st.sidebar:
         st.rerun()
     st.caption("새 상담을 시작하면 앞 대화 맥락이 초기화됩니다.")
     st.divider()
-
-
-# ---- 개인정보 마스킹: 문의 원문을 Claude·임베딩 API로 보내기 전에 적용 ----
-PII_PATTERNS = [
-    (re.compile(r"(?<!\d)20\d{14}(?!\d)"), "[주문번호]"),                       # 스마트스토어 주문번호(16자리)
-    (re.compile(r"(?<!\d)01[016789][-\s.]?\d{3,4}[-\s.]?\d{4}(?!\d)"), "[전화번호]"),
-    (re.compile(r"(?<!\d)0\d{1,2}[-\s.]\d{3,4}[-\s.]\d{4}(?!\d)"), "[전화번호]"),
-    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "[이메일]"),
-    (re.compile(r"[가-힣]+(?:특별시|광역시|도|시)\s?[가-힣]+(?:시|군|구)\s?[가-힣0-9]+(?:로|길)\s?\d+(?:-\d+)?"), "[주소]"),
-    (re.compile(r"(?<!\d)\d{10,}(?!\d)"), "[번호]"),                             # 상품번호·송장번호 등 긴 숫자
-]
-
-
-def mask_pii(text: str):
-    masked = text
-    for pattern, label in PII_PATTERNS:
-        masked = pattern.sub(label, masked)
-    return masked, masked != text
-
-
-# ---- 규정 검사: 의약외품(생리대) 효능 표현 경고 ----
-# 단어 일치 방식이라 "효과는 안내드릴 수 없습니다" 같은 부정문에도 걸릴 수 있으므로 차단하지 않고 경고만 표시합니다.
-BANNED_PATTERN = re.compile(
-    r"생리통|생리불순|질염|발진|가려움|짓무름|냄새\s*제거|예방|완화|치료|개선|항균|살균|무독성|1위"
-)
-
-
-# 부정·불가 표현이 있는 문장("효과는 안내드릴 수 없습니다")은 단순 오탐일 가능성이 높아 경고 대신 '확인 권장'으로 분리합니다.
-# 단, "트러블이 없습니다"처럼 부정형 보장 표현도 있으므로 제외하지 않고 판매자에게 보여줍니다.
-NEGATION_PATTERN = re.compile(r"(?:안내|말씀)드릴[^.!?]{0,6}없|보장[^.!?]{0,10}(?:어렵|없|않)|확인되지\s*않|검증된\s*바\s*없|효과는\s*없")
-
-
-def extract_draft(answer: str) -> str:
-    """에이전트 출력에서 고객에게 보낼 '답변 초안' 부분만 추출(근거·확인 필요 절 제외)"""
-    draft = re.split(r"\*\*근거\*\*|\*\*확인 필요\*\*", answer)[0]
-    return draft.replace("**답변 초안**", "").strip()
-
-
-def check_compliance(text: str):
-    claims, negated = set(), set()
-    for sentence in re.split(r"(?<=[.!?。])\s+|\n+", extract_draft(text)):
-        hits = set(BANNED_PATTERN.findall(sentence))
-        if not hits:
-            continue
-        (negated if NEGATION_PATTERN.search(sentence) else claims).update(hits)
-    return {"ok": not claims, "hits": sorted(claims), "negated_hits": sorted(negated - claims)}
-
-
-# ---- 질문 임베딩: Cloudflare Workers AI의 bge-m3 (앱 안에서 모델을 돌리지 않음) ----
-# Colab의 로컬 bge-m3 벡터와 코사인 유사도 1.0000으로 일치함을 확인했습니다(CLS 풀링, 1024차원).
-def embed_query(text: str) -> list:
-    account_id = (get_secret("CF_ACCOUNT_ID") or "").strip()
-    token = (get_secret("CF_API_TOKEN") or "").strip()
-    if not account_id or not token:
-        raise RuntimeError("CF_ACCOUNT_ID 또는 CF_API_TOKEN이 설정되지 않았습니다.")
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/baai/bge-m3"
-    last = None
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                json={"text": [text], "truncate_inputs": True},
-                timeout=20,
-            )
-            r.raise_for_status()
-            body = r.json()
-            if not body.get("success", True):
-                raise RuntimeError(body.get("errors"))
-            vec = body["result"]["data"][0]
-            norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-            return [x / norm for x in vec]
-        except Exception as ex:
-            last = ex
-            time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"임베딩 요청 실패: {last}")
-
-
-# ---- 하이브리드 검색: 3개 컬렉션 벡터 검색 → 상위 top_k → Neo4j 관계 확장 ----
-def hybrid_search(query: str, top_k: int = 5):
-    query_vec = embed_query(query)
-
-    scored_hits = []
-    for coll in available_collections:
-        try:
-            response = qdrant.query_points(collection_name=coll, query=query_vec, limit=top_k)
-        except Exception:
-            continue
-        for hit in response.points:
-            scored_hits.append((hit.score, hit, coll))
-
-    scored_hits.sort(key=lambda x: x[0], reverse=True)
-    scored_hits = scored_hits[:top_k]
-
-    results = []
-    for score, hit, coll in scored_hits:
-        entry = {
-            "score": round(score, 3),
-            "source_document": CS_COLLECTIONS.get(coll, coll),
-            "section": hit.payload.get("section", ""),
-            "text": hit.payload["text"],
-            "related_facts": [],
-        }
-        entity_ids = hit.payload.get("entity_ids")
-        if neo4j_ok and entity_ids:
-            try:
-                entry["related_facts"] = run_cypher(
-                    """
-                    MATCH (a:Entity)-[r:RELATES]-(b:Entity)
-                    WHERE a.canonical_id IN $ids
-                    RETURN a.name AS source, r.type AS relation, b.name AS target
-                    LIMIT 10
-                    """,
-                    {"ids": entity_ids},
-                )
-            except Exception:
-                pass
-        results.append(entry)
-    return results
-
-
-# ---- 에이전트 tool-use 로직 ----
-AGENT_TOOLS = [
-    {
-        "name": "search_knowledge",
-        "description": "스토어의 상품 정보, 고객·배송 안내(취소·교환·반품·배송 정책), 과거 문의·모범 답변 이력을 "
-                       "벡터 검색과 지식그래프 관계 확장으로 조회합니다. 고객 문의에 답하기 전에 반드시 사용하세요.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "검색할 질의문(고객 문의의 핵심을 요약)"}},
-            "required": ["query"],
-        },
-    }
-]
-
-SYSTEM_PROMPT = f"""너는 생리대 쇼핑몰 '{BRAND_NAME}'({COMPANY_NAME})의 CS 답변 초안을 작성하는 보조 에이전트야.
-판매자가 고객 문의를 붙여넣으면, 판매자가 검토한 뒤 고객에게 보낼 답변 초안을 만든다.
-
-[작업 순서]
-1. search_knowledge 도구로 관련 상품 정보·정책·과거 문의 이력을 조회한다. 필요하면 검색어를 바꿔 한 번 더 조회한다.
-2. 조회된 내용에 근거해서만 답한다. 근거가 없는 내용은 추측하지 말고 "확인 후 안내드리겠습니다"로 처리한다.
-   근거에 없는 일반 상식·권장 사항(예: 보관 요령, 사용 팁)도 덧붙이지 않는다.
-3. 과거 문의 이력의 모범 답변이 있으면 그 말투와 구성을 따른다.
-
-[반드시 지킬 규칙]
-- 생리대는 의약외품이다. 생리통·생리불순·질염·발진·가려움 등 증상의 예방·완화·치료나 피부 트러블이 없다는 보장 표현을 쓰지 않는다.
-  관련 질문에는 "문의하신 증상에 대한 효과는 안내드릴 수 없습니다"처럼 답하고, 답변 초안에는 생리통·질염·발진·가려움·예방·완화·치료 같은 단어를
-  부정문으로도 쓰지 않는다(근거 절에서는 인용 가능).
-- "100% 유기농"은 표지(탑시트) 기준이다. 생리대 전체 중 유기농 순면 비율은 7%라는 점을 섞어 말하지 않도록 구분한다.
-- 주문 취소 문의는 배송 방식(N배송/일반배송)에 따라 답이 다르므로 둘을 구분해 안내한다.
-- 개별 주문의 배송 상태·결제 내역처럼 조회할 수 없는 정보는 구매 내역 확인 또는 판매자 확인이 필요하다고 안내한다.
-- 판매자가 이어서 묻는 후속 질문은 앞 대화 맥락을 이어받아 답한다.
-
-[출력 형식]
-**답변 초안**
-(고객에게 보낼 문장. "안녕하세요, {BRAND_NAME}입니다."로 시작, 3~6문장, 정중한 존댓말)
-
-**근거**
-- [출처 문서] 근거 내용 한 줄 (조회 결과의 source_document를 그대로 사용)
-
-**확인 필요** (근거가 부족한 내용이 있을 때만)
-- 판매자가 확인해야 할 사항
-"""
-
-
-def run_tool(name, tool_input):
-    if name == "search_knowledge":
-        try:
-            return json.dumps(hybrid_search(tool_input["query"]), ensure_ascii=False)
-        except Exception as ex:
-            return json.dumps({"error": f"검색에 실패했습니다: {ex}"}, ensure_ascii=False)
-    return "알 수 없는 도구입니다."
-
-
-def build_history(messages: list, max_messages: int = HISTORY_TURNS):
-    """최근 대화를 텍스트만 추려 Claude messages 형식으로 변환 (2주차 앱 한계: 대화 기록 미전달 → 개선)"""
-    recent = messages[-max_messages:]
-    history = [{"role": m["role"], "content": m["content"]} for m in recent]
-    while history and history[0]["role"] != "user":   # 첫 메시지는 user여야 함
-        history.pop(0)
-    return history
-
-
-def is_malformed(text: str) -> bool:
-    """도구 호출을 텍스트로 흉내 냈거나(<invoke ...>), 정해진 출력 형식이 빠진 경우"""
-    return "<invoke" in text or "<parameter" in text or "답변 초안" not in text
-
-
-def ask_agent(question: str, history: list):
-    messages = history + [{"role": "user", "content": question}]
-    retried = False
-    for step in range(6):  # 도구 호출 반복 상한
-        kwargs = dict(model="claude-sonnet-5", max_tokens=2000, tools=AGENT_TOOLS,
-                      system=SYSTEM_PROMPT, messages=messages)
-        if step == 0:
-            # 첫 응답은 반드시 검색 도구를 호출(근거 없이 답하거나 도구 호출을 텍스트로 흉내 내는 오류 방지)
-            kwargs["tool_choice"] = {"type": "any"}
-        response = client.messages.create(**kwargs)
-
-        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-        if not tool_use_blocks:
-            text = "\n".join(b.text for b in response.content if b.type == "text")
-            if is_malformed(text) and not retried:
-                retried = True
-                messages.append({"role": "assistant", "content": text or "(빈 응답)"})
-                messages.append({"role": "user", "content":
-                    "도구는 텍스트로 쓰지 말고 실제 도구 호출로 사용하고, 정해진 출력 형식"
-                    "(**답변 초안** / **근거** / 필요 시 **확인 필요**)으로 다시 작성해 주세요."})
-                continue
-            return text
-
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": b.id, "content": run_tool(b.name, b.input)}
-            for b in tool_use_blocks
-        ]})
-    return "검색을 여러 번 반복했지만 답변을 정리하지 못했습니다. 질문을 조금 더 구체적으로 입력해 주세요."
 
 
 # ---- 채팅 UI ----
@@ -703,25 +458,20 @@ def render_checks(meta: dict):
 
 
 def handle_question(question: str):
-    masked_q, was_masked = mask_pii(question)
-    history = build_history(st.session_state.messages)
-
-    st.session_state.messages.append({"role": "user", "content": masked_q})
     with st.chat_message("user"):
-        st.markdown(masked_q)
+        st.markdown(mask_pii(question)[0])   # 화면에도 마스킹된 문의만 표시
 
     with st.chat_message("assistant"):
         with st.spinner("근거를 찾아 답변 초안을 작성하는 중..."):
             try:
-                answer = ask_agent(masked_q, history)
+                # 마스킹 → 에이전트(검색·답변) → 규정 검사 (cs_core.CSAssistant.answer)
+                masked_q, answer, meta = core.answer(question, st.session_state.messages)
             except Exception as ex:
-                answer = f"답변 생성 중 오류가 발생했습니다: {ex}"
-        result = check_compliance(answer)
-        meta = {"masked": was_masked, "checked": True,
-                "compliance_hits": result["hits"], "negated_hits": result["negated_hits"]}
+                masked_q, answer, meta = question, f"답변 생성 중 오류가 발생했습니다: {ex}", {}
         st.markdown(answer)
         render_checks(meta)
 
+    st.session_state.messages.append({"role": "user", "content": masked_q})
     st.session_state.messages.append({"role": "assistant", "content": answer, "meta": meta})
 
 
