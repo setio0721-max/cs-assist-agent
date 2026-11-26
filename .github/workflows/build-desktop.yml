@@ -24,13 +24,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install anthropic requests certifi pyinstaller
+          pip install anthropic requests certifi httpx pyinstaller
 
       - name: Import check
         run: python -c "import cs_core, desktop_app; print('import ok')"
 
       - name: Build exe (PyInstaller, onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name CSAssistant --collect-data certifi desktop_app.py
+        run: pyinstaller --noconfirm --onedir --windowed --name CSAssistant --collect-data certifi --collect-all httpx --collect-all httpcore --collect-all anthropic --hidden-import h11 --hidden-import anyio desktop_app.py
 
       - name: Self-test built exe
         shell: pwsh
