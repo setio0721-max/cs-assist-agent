@@ -641,19 +641,33 @@ def build_history(messages: list, max_messages: int = HISTORY_TURNS):
     return history
 
 
+def is_malformed(text: str) -> bool:
+    """도구 호출을 텍스트로 흉내 냈거나(<invoke ...>), 정해진 출력 형식이 빠진 경우"""
+    return "<invoke" in text or "<parameter" in text or "답변 초안" not in text
+
+
 def ask_agent(question: str, history: list):
     messages = history + [{"role": "user", "content": question}]
-    for _ in range(5):  # 도구 호출 반복 상한
-        response = client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=2000,
-            tools=AGENT_TOOLS,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-        )
+    retried = False
+    for step in range(6):  # 도구 호출 반복 상한
+        kwargs = dict(model="claude-sonnet-5", max_tokens=2000, tools=AGENT_TOOLS,
+                      system=SYSTEM_PROMPT, messages=messages)
+        if step == 0:
+            # 첫 응답은 반드시 검색 도구를 호출(근거 없이 답하거나 도구 호출을 텍스트로 흉내 내는 오류 방지)
+            kwargs["tool_choice"] = {"type": "any"}
+        response = client.messages.create(**kwargs)
+
         tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
         if not tool_use_blocks:
-            return "\n".join(b.text for b in response.content if b.type == "text")
+            text = "\n".join(b.text for b in response.content if b.type == "text")
+            if is_malformed(text) and not retried:
+                retried = True
+                messages.append({"role": "assistant", "content": text or "(빈 응답)"})
+                messages.append({"role": "user", "content":
+                    "도구는 텍스트로 쓰지 말고 실제 도구 호출로 사용하고, 정해진 출력 형식"
+                    "(**답변 초안** / **근거** / 필요 시 **확인 필요**)으로 다시 작성해 주세요."})
+                continue
+            return text
 
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": [
