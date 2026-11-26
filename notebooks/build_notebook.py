@@ -18,10 +18,10 @@ md("""# CS 답변 보조 챗봇 — 지식 적재 노트북
 | 6 | 임베딩·벡터 저장(1024차원, COSINE) | bge-m3(Cloudflare Workers AI) + Qdrant Cloud |
 | 7 | 적재 확인·검색 테스트 | — |
 
-**준비**: 왼쪽 🔑(Secrets)에 `ANTHROPIC_API_KEY`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`, `QDRANT_URL`, `QDRANT_API_KEY`, `CF_ACCOUNT_ID`, `CF_API_TOKEN`을 등록하고 노트북 접근을 허용하세요. GPU는 필요 없습니다.
+**준비**: 왼쪽 🔑(Secrets)에 `ANTHROPIC_API_KEY`, `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`, `QDRANT_URL`, `QDRANT_API_KEY`, `CF_ACCOUNT_ID`, `CF_API_TOKEN`을 등록하고 노트북 접근을 허용하세요. Cloudflare 키가 없으면 Colab에서 bge-m3를 직접 실행합니다(GPU 권장, CPU도 가능).
 """)
 
-code("""!pip -q install anthropic qdrant-client rapidfuzz openpyxl requests""")
+code("""!pip -q install anthropic qdrant-client rapidfuzz openpyxl requests sentence-transformers""")
 
 md("## 0. 설정")
 code("""import json, math, re, time, uuid, io
@@ -38,7 +38,14 @@ ANTHROPIC_API_KEY = secret("ANTHROPIC_API_KEY")
 NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD = secret("NEO4J_URI"), secret("NEO4J_USER"), secret("NEO4J_PASSWORD")
 NEO4J_DATABASE = userdata.get("NEO4J_DATABASE") or "neo4j"
 QDRANT_URL, QDRANT_API_KEY = secret("QDRANT_URL"), secret("QDRANT_API_KEY")
-CF_ACCOUNT_ID, CF_API_TOKEN = secret("CF_ACCOUNT_ID"), secret("CF_API_TOKEN")
+# Cloudflare 키가 있으면 앱과 같은 Workers AI bge-m3, 없으면 Colab에서 bge-m3를 직접 실행(6단계)
+def optional_secret(k):
+    try:
+        return (userdata.get(k) or "").strip()
+    except Exception:
+        return ""
+CF_ACCOUNT_ID, CF_API_TOKEN = optional_secret("CF_ACCOUNT_ID"), optional_secret("CF_API_TOKEN")
+print("임베딩:", "Cloudflare Workers AI bge-m3" if CF_ACCOUNT_ID and CF_API_TOKEN else "Colab 로컬 bge-m3")
 
 MODEL = "claude-sonnet-5"
 GITHUB_RAW = "https://raw.githubusercontent.com/setio0721-max/cs-assist-agent/main/data"
@@ -249,11 +256,19 @@ cypher("""UNWIND $rows AS row
 print(cypher("MATCH (e:Entity) WHERE e.canonical_id STARTS WITH 'cs:' RETURN count(e) AS cs_entities"))
 print(cypher("MATCH (a:Entity)-[r:RELATES]->() WHERE a.canonical_id STARTS WITH 'cs:' RETURN count(r) AS cs_relations"))''')
 
-md("## 6. 임베딩·벡터 저장 (bge-m3 + Qdrant Cloud)\n앱의 질문 임베딩과 같은 Cloudflare Workers AI bge-m3(1024차원)를 써서 문서·질문 벡터 공간을 맞춥니다. 컬렉션은 매번 새로 만듭니다.")
+md("## 6. 임베딩·벡터 저장 (bge-m3 + Qdrant Cloud)\nbge-m3(1024차원)로 임베딩합니다. Cloudflare 키가 있으면 앱과 같은 Workers AI를, 없으면 Colab 로컬 모델을 씁니다(같은 벡터 공간). 컬렉션은 매번 새로 만듭니다.")
 code('''from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 
+_local_model = None
 def embed(texts, batch=16):
+    """bge-m3 1024차원, L2 정규화. 앱의 질문 임베딩(Cloudflare bge-m3, CLS 풀링)과 같은 벡터 공간"""
+    global _local_model
+    if not (CF_ACCOUNT_ID and CF_API_TOKEN):
+        if _local_model is None:
+            from sentence_transformers import SentenceTransformer
+            _local_model = SentenceTransformer("BAAI/bge-m3")   # 최초 1회 약 2GB 다운로드
+        return _local_model.encode(texts, batch_size=batch, normalize_embeddings=True).tolist()
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/baai/bge-m3"
     out = []
     for i in range(0, len(texts), batch):
