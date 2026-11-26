@@ -486,9 +486,25 @@ BANNED_PATTERN = re.compile(
 )
 
 
+# 부정·불가 표현이 있는 문장("효과는 안내드릴 수 없습니다")은 단순 오탐일 가능성이 높아 경고 대신 '확인 권장'으로 분리합니다.
+# 단, "트러블이 없습니다"처럼 부정형 보장 표현도 있으므로 제외하지 않고 판매자에게 보여줍니다.
+NEGATION_PATTERN = re.compile(r"(?:안내|말씀)드릴[^.!?]{0,6}없|보장[^.!?]{0,10}(?:어렵|없|않)|확인되지\s*않|검증된\s*바\s*없|효과는\s*없")
+
+
+def extract_draft(answer: str) -> str:
+    """에이전트 출력에서 고객에게 보낼 '답변 초안' 부분만 추출(근거·확인 필요 절 제외)"""
+    draft = re.split(r"\*\*근거\*\*|\*\*확인 필요\*\*", answer)[0]
+    return draft.replace("**답변 초안**", "").strip()
+
+
 def check_compliance(text: str):
-    hits = sorted(set(BANNED_PATTERN.findall(text)))
-    return {"ok": not hits, "hits": hits}
+    claims, negated = set(), set()
+    for sentence in re.split(r"(?<=[.!?。])\s+|\n+", extract_draft(text)):
+        hits = set(BANNED_PATTERN.findall(sentence))
+        if not hits:
+            continue
+        (negated if NEGATION_PATTERN.search(sentence) else claims).update(hits)
+    return {"ok": not claims, "hits": sorted(claims), "negated_hits": sorted(negated - claims)}
 
 
 # ---- 질문 임베딩: Cloudflare Workers AI의 bge-m3 (앱 안에서 모델을 돌리지 않음) ----
@@ -588,7 +604,8 @@ SYSTEM_PROMPT = f"""너는 생리대 쇼핑몰 '{BRAND_NAME}'({COMPANY_NAME})의
 
 [반드시 지킬 규칙]
 - 생리대는 의약외품이다. 생리통·생리불순·질염·발진·가려움 등 증상의 예방·완화·치료나 피부 트러블이 없다는 보장 표현을 쓰지 않는다.
-  관련 질문에는 "문의하신 증상에 대한 효과는 안내드릴 수 없습니다"처럼 해당 단어를 반복하지 않고 답한다.
+  관련 질문에는 "문의하신 증상에 대한 효과는 안내드릴 수 없습니다"처럼 답하고, 답변 초안에는 생리통·질염·발진·가려움·예방·완화·치료 같은 단어를
+  부정문으로도 쓰지 않는다(근거 절에서는 인용 가능).
 - "100% 유기농"은 표지(탑시트) 기준이다. 생리대 전체 중 유기농 순면 비율은 7%라는 점을 섞어 말하지 않도록 구분한다.
 - 주문 취소 문의는 배송 방식(N배송/일반배송)에 따라 답이 다르므로 둘을 구분해 안내한다.
 - 개별 주문의 배송 상태·결제 내역처럼 조회할 수 없는 정보는 구매 내역 확인 또는 판매자 확인이 필요하다고 안내한다.
@@ -659,11 +676,15 @@ def render_checks(meta: dict):
     if meta.get("masked"):
         st.info("🔒 문의에 포함된 개인정보(전화번호·주문번호 등)를 가린 뒤 처리했습니다.")
     hits = meta.get("compliance_hits") or []
+    negated = meta.get("negated_hits") or []
     if hits:
-        st.warning(f"⚠️ 규정 검사: 의약외품 광고에서 주의할 표현({', '.join(hits)})이 포함되어 있습니다. "
+        st.warning(f"⚠️ 규정 검사: 답변 초안에 의약외품 광고에서 주의할 표현({', '.join(hits)})이 있습니다. "
                    "효능을 주장하는 문장인지 확인 후 발송하세요.")
+    elif negated:
+        st.caption(f"🔎 규정 검사: 부정문 안에 주의 단어({', '.join(negated)})가 있습니다. "
+                   "효능을 부정하는 문장인지 한 번 확인하세요.")
     elif meta.get("checked"):
-        st.caption("✅ 규정 검사 통과(효능 표현 없음)")
+        st.caption("✅ 규정 검사 통과(답변 초안에 효능 표현 없음)")
 
 
 def handle_question(question: str):
@@ -680,8 +701,9 @@ def handle_question(question: str):
                 answer = ask_agent(masked_q, history)
             except Exception as ex:
                 answer = f"답변 생성 중 오류가 발생했습니다: {ex}"
+        result = check_compliance(answer)
         meta = {"masked": was_masked, "checked": True,
-                "compliance_hits": check_compliance(answer)["hits"]}
+                "compliance_hits": result["hits"], "negated_hits": result["negated_hits"]}
         st.markdown(answer)
         render_checks(meta)
 
