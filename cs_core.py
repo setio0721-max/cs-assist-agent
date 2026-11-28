@@ -1,11 +1,12 @@
 """
-CS 답변 보조 챗봇 - 공통 핵심 로직 (웹 앱 streamlit_app.py와 데스크톱 프로그램 desktop_app.py가 함께 사용)
+CS 답변 보조 챗봇 - 핵심 로직 (데스크톱 프로그램 desktop_app.py가 사용)
 
 구성
 - 개인정보 마스킹 / 규정 검사(의약외품 효능 표현) / 대화 기록 구성
 - 질문 임베딩: Cloudflare Workers AI bge-m3 (Colab 적재 시 로컬 bge-m3와 같은 벡터 공간)
 - 하이브리드 검색: Qdrant REST API 벡터 top-k → Neo4j Query API(HTTPS)로 관계 확장
 - 에이전트: Claude tool-use (첫 응답은 검색 도구 호출 강제, 형식 오류 시 1회 재작성)
+- 운영 정보: 소비기한·상품 규격·명절 배송 공지를 Neo4j에 저장하고 답변 때마다 프롬프트에 반영(cs_ops.py)
 
 외부 통신은 모두 HTTPS(443)만 사용하므로 방화벽·호스팅 제약에 강하고, 데스크톱 exe 빌드 시 의존성이 가볍다.
 """
@@ -17,6 +18,8 @@ import time
 
 import anthropic
 import requests
+
+import cs_ops
 
 # ---- 수업용 가상 브랜드 설정: 이름을 바꾸려면 이 두 값만 수정 ----
 BRAND_NAME = "온솜결"
@@ -149,6 +152,8 @@ SYSTEM_PROMPT = f"""너는 생리대 쇼핑몰 '{BRAND_NAME}'({COMPANY_NAME})의
 - 주문 취소 문의는 배송 방식(N배송/일반배송)에 따라 답이 다르므로 둘을 구분해 안내한다.
 - 개별 주문의 배송 상태·결제 내역처럼 조회할 수 없는 정보는 구매 내역 확인 또는 판매자 확인이 필요하다고 안내한다.
 - 판매자가 이어서 묻는 후속 질문은 앞 대화 맥락을 이어받아 답한다.
+- 프롬프트 끝의 [운영 정보]는 판매자가 관리하는 최신 값이다. 검색 결과(지식 문서·과거 문의 이력)와 날짜·수치가 다르면 운영 정보를 따른다.
+- [운영 정보]에 적용 중인 배송 공지가 있고 문의가 배송·주문·도착·취소와 관련되면, 공지의 마감일·휴무일을 답변 초안에 포함한다.
 
 [출력 형식]
 **답변 초안**
@@ -166,7 +171,7 @@ SYSTEM_PROMPT = f"""너는 생리대 쇼핑몰 '{BRAND_NAME}'({COMPANY_NAME})의
 # 5. 외부 서비스 연결 + 검색 + 에이전트
 # =====================================================================
 class CSAssistant:
-    """설정값(dict)만 받으면 웹 앱·데스크톱 어디서든 같은 방식으로 동작"""
+    """설정값(dict)만 받으면 동작(데스크톱 프로그램, Colab 등)"""
 
     def __init__(self, settings: dict):
         missing = [k for k in REQUIRED_SETTINGS if k != "NEO4J_DATABASE" and not (settings.get(k) or "").strip()]
@@ -285,11 +290,29 @@ class CSAssistant:
         return "알 수 없는 도구입니다."
 
     # ---- 에이전트 tool-use 루프 ----
-    def ask_agent(self, question: str, history: list):
+    # ---- 운영 정보: Neo4j (:OpsConfig {key:'main'})에 JSON으로 저장 ----
+    def load_ops(self) -> dict:
+        if not self.neo4j_ok:
+            return cs_ops.merge_defaults({})
+        rows = self.run_cypher("MATCH (o:OpsConfig {key: 'main'}) RETURN o.json AS json")
+        if rows and rows[0]["json"]:
+            return cs_ops.merge_defaults(json.loads(rows[0]["json"]))
+        ops = cs_ops.merge_defaults({})
+        self.save_ops(ops)               # 처음 실행: 기본값(상품 정보 문서와 같은 값) 저장
+        return ops
+
+    def save_ops(self, ops: dict):
+        if not self.neo4j_ok:
+            raise RuntimeError("그래프 DB(Neo4j)에 연결되지 않아 저장할 수 없습니다.")
+        self.run_cypher("MERGE (o:OpsConfig {key: 'main'}) SET o.json = $json, o.saved_at = $at",
+                        {"json": cs_ops.dumps(ops), "at": cs_ops.datetime.now(cs_ops.KST).isoformat(timespec="seconds")})
+
+    def ask_agent(self, question: str, history: list, ops: dict = None):
+        system = SYSTEM_PROMPT + cs_ops.ops_context(ops or cs_ops.merge_defaults({}))
         messages = history + [{"role": "user", "content": question}]
         retried = False
         for step in range(6):  # 도구 호출 반복 상한
-            kwargs = dict(model=MODEL, max_tokens=2000, tools=AGENT_TOOLS, system=SYSTEM_PROMPT, messages=messages)
+            kwargs = dict(model=MODEL, max_tokens=2000, tools=AGENT_TOOLS, system=system, messages=messages)
             if step == 0:
                 kwargs["tool_choice"] = {"type": "any"}  # 첫 응답은 반드시 검색(근거 없는 답·텍스트 도구 호출 방지)
             response = self.client.messages.create(**kwargs)
@@ -316,8 +339,13 @@ class CSAssistant:
     # ---- 한 번에 처리: 마스킹 → 에이전트 → 규정 검사 ----
     def answer(self, question: str, messages: list):
         masked_q, was_masked = mask_pii(question)
-        answer = self.ask_agent(masked_q, build_history(messages))
+        try:
+            ops = self.load_ops()
+        except Exception:
+            ops = cs_ops.merge_defaults({})    # 운영 정보를 못 읽어도 답변은 계속
+        answer = self.ask_agent(masked_q, build_history(messages), ops)
         result = check_compliance(answer)
         meta = {"masked": was_masked, "checked": True,
-                "compliance_hits": result["hits"], "negated_hits": result["negated_hits"]}
+                "compliance_hits": result["hits"], "negated_hits": result["negated_hits"],
+                "notices": [n["title"] for n in cs_ops.active_notices(ops)]}
         return masked_q, answer, meta
