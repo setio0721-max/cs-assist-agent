@@ -3,7 +3,7 @@ Colab Secrets로 settings를 만든 뒤 실행: 운영 정보를 바꾸고 답�
 사용: settings(dict)와 (선택) embed_fn이 정의된 상태에서 exec
 """
 import importlib, sys, requests, re
-BASE = "https://raw.githubusercontent.com/setio0721-max/cs-assist-agent/main/"
+BASE = f"https://raw.githubusercontent.com/setio0721-max/cs-assist-agent/{globals().get('REF', 'main')}/"
 for name in ["cs_ops", "cs_core"]:
     open(f"{name}.py", "w", encoding="utf-8").write(requests.get(BASE + f"{name}.py", timeout=20).text)
 sys.path.insert(0, ".")
