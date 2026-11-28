@@ -12,6 +12,20 @@ for name in ["cs_ops", "cs_core"]:
         importlib.reload(sys.modules[name])
 import cs_ops, cs_core
 
+if "settings" not in globals():          # Colab Secrets에서 읽기
+    from google.colab import userdata
+    def _get(k):
+        try:
+            return (userdata.get(k) or "").strip()
+        except Exception:
+            return ""
+    settings = {k: _get(k) for k in cs_core.REQUIRED_SETTINGS}
+if not (settings.get("CF_ACCOUNT_ID") and settings.get("CF_API_TOKEN")) and not globals().get("embed_fn"):
+    settings["CF_ACCOUNT_ID"] = settings["CF_API_TOKEN"] = "local"
+    from sentence_transformers import SentenceTransformer
+    _m = SentenceTransformer("BAAI/bge-m3")
+    embed_fn = lambda text: _m.encode([text], normalize_embeddings=True)[0].tolist()
+
 vcore = cs_core.CSAssistant(settings)
 if globals().get("embed_fn"):
     vcore.embed_query = embed_fn
