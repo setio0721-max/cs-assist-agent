@@ -20,7 +20,7 @@ if "settings" not in globals():          # Colab Secrets에서 읽기
         except Exception:
             return ""
     settings = {k: _get(k) for k in cs_core.REQUIRED_SETTINGS}
-if not (settings.get("CF_ACCOUNT_ID") and settings.get("CF_API_TOKEN")) and not globals().get("embed_fn"):
+if settings.get("CF_ACCOUNT_ID") in ("", None, "local") and not globals().get("embed_fn"):
     settings["CF_ACCOUNT_ID"] = settings["CF_API_TOKEN"] = "local"
     from sentence_transformers import SentenceTransformer
     _m = SentenceTransformer("BAAI/bge-m3")
